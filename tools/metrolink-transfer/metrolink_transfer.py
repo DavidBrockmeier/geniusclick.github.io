@@ -33,6 +33,7 @@ excluded from the delay histogram.
 """
 
 import argparse
+import base64
 import os
 from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
@@ -46,9 +47,20 @@ import pandas as pd
 # ----------------------------------------------------------------------------- config
 LA = ZoneInfo("America/Los_Angeles")
 
+# PLACEHOLDER -- this value is known-bad: it decodes to a corrupted, non-Metrolink
+# URL and 404s on every date. Replace it with Metrolink's real trip-updates feed,
+# either by passing --feed-url <url> (encoded for you) or --base64url <value>
+# (copied from the gtfsrt.io inventory). See README.
 FEED_HASH = "YUhSMGNEb3ZMMk5rYmk1emFXMXdiR2xtZlhObGNuWnBZMlV1WTI5dEwzSmxjR2x6WlhVdVluSg"
 BASE_URL = "http://parquet.gtfsrt.io/trip-updates"
 SANTA_ANA_ID = "92004"
+
+FEED_B64 = FEED_HASH  # the base64url path segment actually used; set at runtime
+
+
+def encode_feed_url(feed_url):
+    """gtfsrt.io archive path wants the URL-safe base64 of the feed URL, no padding."""
+    return base64.urlsafe_b64encode(feed_url.encode()).rstrip(b"=").decode()
 
 ARRIVING = {"label": "IEOC 827", "num": "827", "sched": time(18, 9)}   # arrives Santa Ana
 DEPARTING = {"label": "OC 627",  "num": "627", "sched": time(18, 26)}  # departs Santa Ana
@@ -62,7 +74,7 @@ OUT_XLSX = "metrolink_transfer.xlsx"
 
 
 def url_for(date_str):
-    return f"{BASE_URL}/date={date_str}/base64url={FEED_HASH}/data.parquet"
+    return f"{BASE_URL}/date={date_str}/base64url={FEED_B64}/data.parquet"
 
 
 def weekdays(days):
@@ -332,11 +344,31 @@ if __name__ == "__main__":
     p.add_argument("--days", type=int, default=60,
                    help="weekday window to scan (default 60; slack metric is valid across "
                         "the 2026-05-10 schedule change, delay metric uses post-change days)")
+    p.add_argument("--feed-url", help="Metrolink trip-updates feed URL; encoded to the "
+                                      "archive's base64url path segment for you")
+    p.add_argument("--base64url", help="the archive base64url value directly (copy it from "
+                                       "the gtfsrt.io inventory)")
+    p.add_argument("--encode", metavar="URL", help="print the base64url for a feed URL and exit")
     args = p.parse_args()
+
+    if args.encode:
+        print(encode_feed_url(args.encode))
+        raise SystemExit(0)
+
+    # Resolve which feed identifier to use, most explicit wins.
+    if args.base64url:
+        FEED_B64 = args.base64url
+    elif args.feed_url:
+        FEED_B64 = encode_feed_url(args.feed_url)
+        print(f"Using base64url: {FEED_B64}")
 
     if args.discover:
         discover(_connect())
     elif args.demo:
         run(demo_records(args.days), "DEMO")
     else:
+        if FEED_B64 == FEED_HASH:
+            print("WARNING: using the known-bad placeholder feed id -- every date will 404.\n"
+                  "         Pass --feed-url <url> or --base64url <value> from the gtfsrt.io "
+                  "inventory.\n")
         run(collect_real(args.days), "LIVE")

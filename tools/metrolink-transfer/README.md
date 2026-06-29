@@ -28,6 +28,34 @@ Prefer plain Python? `pip install duckdb pandas matplotlib openpyxl tzdata` then
 > `trip_id` strings so you can confirm 827/627 are matched as whole train numbers before
 > trusting any output.
 
+## Set the feed identifier (required before any live run)
+
+The archive path is `…/trip-updates/date=<date>/base64url=<value>/data.parquet`, where
+`<value>` is the URL-safe base64 (no padding) of the **feed's source URL**. It is stable
+across dates — it identifies the agency feed, not the day.
+
+The `FEED_HASH` placeholder in the script is **known-bad**: it decodes to a corrupted,
+non-Metrolink URL and 404s on every date. You must supply Metrolink's real trip-updates
+feed identifier. Two ways:
+
+```bash
+# A) copy Metrolink's trip-updates base64url straight from the gtfsrt.io inventory:
+uv run metrolink_transfer.py --base64url <value> --days 60
+
+# B) give it the feed URL and let it encode for you:
+uv run metrolink_transfer.py --feed-url "https://cdn.simplifytransit.com/metrolink/.../trip-updates.pb" --days 60
+
+# just compute an encoding without running:
+uv run metrolink_transfer.py --encode "https://…/trip-updates.pb"
+```
+
+Find the exact value/URL in the inventory table at <https://gtfsrt.io>. Quick sanity check
+before a full run — this should return `200`, not `404`:
+
+```bash
+curl -sI "http://parquet.gtfsrt.io/trip-updates/date=2026-06-26/base64url=<value>/data.parquet" | head -1
+```
+
 ## Outputs (overwritten each run)
 
 - `metrolink_transfer.png` — two charts: daily connection margin (green = made it,
