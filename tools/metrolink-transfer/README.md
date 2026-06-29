@@ -11,24 +11,39 @@ of the day?
 ## Run it
 
 The script declares its own dependencies inline (PEP 723), so [`uv`](https://docs.astral.sh/uv/)
-runs it with no manual setup:
+runs it with no manual setup. Install uv once:
+`curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`). Prefer plain
+Python? `pip install duckdb pandas matplotlib openpyxl tzdata` and swap `uv run` for `python`.
+
+### Recommended: download the feed once, analyze locally
+
+The Metrolink trip-updates feed is only ~145 MB. Grab it once from the inventory at
+<https://gtfsrt.io> (a `.parquet` file, a folder, or a hive-partitioned `date=…/` tree),
+then point `--local` at it — no `httpfs`, no per-date HTTP, re-runnable offline:
 
 ```bash
-uv run metrolink_transfer.py --demo        # synthetic data; proves charts/Excel, no network
-uv run metrolink_transfer.py --discover    # confirm the archive's schema + trip_id format
-uv run metrolink_transfer.py --days 60      # the real run (needs open internet)
+uv run metrolink_transfer.py --discover --local path/to/feed.parquet  # inspect schema first
+uv run metrolink_transfer.py --local path/to/feed.parquet              # the analysis
 ```
 
-Install uv once: `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`).
+`--local` derives each connection's service day from the trains' own times at Santa Ana,
+so it works whether or not the download carries a `date` partition.
 
-Prefer plain Python? `pip install duckdb pandas matplotlib openpyxl tzdata` then
-`python metrolink_transfer.py --days 60`.
+### Quick check, no data
 
-> Run `--discover` first. It prints the archive's real column layout and the actual
-> `trip_id` strings so you can confirm 827/627 are matched as whole train numbers before
-> trusting any output.
+```bash
+uv run metrolink_transfer.py --demo        # synthetic data; proves charts/Excel render
+```
 
-## Set the feed identifier (required before any live run)
+> Run `--discover` first on a real download. It prints the actual column layout and the
+> `trip_id` strings so you can confirm 827/627 are matched as whole train numbers (e.g. that
+> a `1827` isn't sneaking in) before trusting any output. If `timestamp` / `stop_time_update`
+> are named differently in the download, that's where you'll see it.
+
+## Per-date HTTP mode (only if you skip the local download)
+
+You don't need this if you use `--local`. It only applies to the `--days N` mode that
+fetches one file per date over HTTP.
 
 The archive path is `…/trip-updates/date=<date>/base64url=<value>/data.parquet`, where
 `<value>` is the URL-safe base64 (no padding) of the **feed's source URL**. It is stable

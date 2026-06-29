@@ -14,14 +14,19 @@ Outputs every run:
   - metrolink_transfer.xlsx  Excel workbook (raw data + summary + embedded chart)
 
 USAGE -- the easy way (no pip, no venv; uv reads the deps above and runs it):
-    uv run metrolink_transfer.py --demo
-    uv run metrolink_transfer.py --discover     # confirm archive schema / trip_id format
-    uv run metrolink_transfer.py --days 60       # real run (needs open internet)
+    uv run metrolink_transfer.py --demo                 # synthetic data, no network
+    uv run metrolink_transfer.py --discover --local feed.parquet   # inspect a download
+    uv run metrolink_transfer.py --local feed.parquet   # RECOMMENDED: analyze a download
+    uv run metrolink_transfer.py --base64url <v> --days 60         # per-date over HTTP
   Install uv once: https://docs.astral.sh/uv/  (curl -LsSf https://astral.sh/uv/install.sh | sh)
 
 USAGE -- the manual way:
     pip install duckdb pandas matplotlib openpyxl tzdata
-    python metrolink_transfer.py --days 60
+    python metrolink_transfer.py --local feed.parquet
+
+The feed is ~145 MB, so the simplest path is to download it once from gtfsrt.io and
+point --local at it (a .parquet file, a folder, or a hive-partitioned date=.../ tree).
+No httpfs, no per-date HTTP, and you can re-run offline as often as you like.
 
 Re-run any time; it overwrites the two output files with the latest window.
 
@@ -99,8 +104,28 @@ def _connect():
     return duckdb.connect()
 
 
-def discover(conn):
-    """Inspect the real schema + trip_id format on a recent day before trusting anything."""
+def local_source(path):
+    """A read_parquet(...) expression for a local file, directory, or hive-partitioned tree."""
+    if os.path.isdir(path):
+        return (f"read_parquet('{path.rstrip('/')}/**/*.parquet', "
+                f"hive_partitioning=1, union_by_name=1)")
+    return f"read_parquet('{path}')"
+
+
+def discover(conn, local=None):
+    """Inspect the real schema + trip_id format before trusting anything."""
+    if local:
+        src = local_source(local)
+        cols = conn.execute(f"DESCRIBE SELECT * FROM {src}").df()
+        print(f"\n=== schema for {local} ===")
+        print(cols[["column_name", "column_type"]].to_string(index=False))
+        ids = conn.execute(
+            f"SELECT DISTINCT trip_id FROM {src} "
+            f"WHERE trip_id LIKE '%827%' OR trip_id LIKE '%627%' LIMIT 50"
+        ).df()
+        print("\nsample matching trip_ids (confirm 827/627 are whole train numbers):")
+        print(ids.to_string(index=False))
+        return
     for date_str in weekdays(7):
         try:
             cols = conn.execute(
@@ -172,6 +197,47 @@ def collect_real(days):
             continue
         records.append({"date": date_str, "arr_827": arr, "dep_627": dep})
     return records
+
+
+def collect_local(path):
+    """
+    Analyze the whole downloaded feed in one pass (no per-date HTTP, no httpfs).
+
+    Groups by the LOCAL service day derived from each train's own time at Santa Ana,
+    so it doesn't depend on any date partition column. Same dedup as the remote path:
+    keep the last prediction per (trip, day). Returns the usual record dicts.
+    """
+    conn = _connect()
+    src = local_source(path)
+    q = f"""
+        WITH flat AS (
+            SELECT trip_id, timestamp AS feed_ts,
+                   u.stop_id AS stop_id,
+                   u.arrival.time   AS arr,
+                   u.departure.time AS dep,
+                   CAST((to_timestamp(COALESCE(u.arrival.time, u.departure.time))
+                         AT TIME ZONE 'America/Los_Angeles') AS DATE) AS svc_day
+            FROM {src}, UNNEST(stop_time_update) AS t(u)
+            WHERE u.stop_id = '{SANTA_ANA_ID}'
+              AND (regexp_matches(trip_id, '(^|[^0-9])827([^0-9]|$)')
+                OR regexp_matches(trip_id, '(^|[^0-9])627([^0-9]|$)'))
+        ),
+        ranked AS (
+            SELECT *, row_number() OVER (PARTITION BY trip_id, svc_day ORDER BY feed_ts DESC) rn
+            FROM flat
+        )
+        SELECT svc_day, trip_id, arr, dep FROM ranked WHERE rn = 1 ORDER BY svc_day
+    """
+    by_day = {}
+    for svc_day, trip_id, arr, dep in conn.execute(q).fetchall():
+        rec = by_day.setdefault(str(svc_day),
+                                {"date": str(svc_day), "arr_827": None, "dep_627": None})
+        if "827" in str(trip_id):
+            rec["arr_827"] = arr
+        elif "627" in str(trip_id):
+            rec["dep_627"] = dep
+    # keep days where 827 (the connecting train we measure) actually showed up
+    return [r for r in by_day.values() if r["arr_827"] is not None]
 
 
 # ----------------------------------------------------------------------------- analysis
@@ -349,13 +415,16 @@ if __name__ == "__main__":
     p.add_argument("--base64url", help="the archive base64url value directly (copy it from "
                                        "the gtfsrt.io inventory)")
     p.add_argument("--encode", metavar="URL", help="print the base64url for a feed URL and exit")
+    p.add_argument("--local", metavar="PATH", help="analyze a downloaded feed (a .parquet file, "
+                                                   "a directory, or a hive-partitioned tree) "
+                                                   "instead of fetching per-date over HTTP")
     args = p.parse_args()
 
     if args.encode:
         print(encode_feed_url(args.encode))
         raise SystemExit(0)
 
-    # Resolve which feed identifier to use, most explicit wins.
+    # Resolve which feed identifier to use, most explicit wins (remote mode only).
     if args.base64url:
         FEED_B64 = args.base64url
     elif args.feed_url:
@@ -363,12 +432,14 @@ if __name__ == "__main__":
         print(f"Using base64url: {FEED_B64}")
 
     if args.discover:
-        discover(_connect())
+        discover(_connect(), local=args.local)
     elif args.demo:
         run(demo_records(args.days), "DEMO")
+    elif args.local:
+        run(collect_local(args.local), "LOCAL")
     else:
         if FEED_B64 == FEED_HASH:
             print("WARNING: using the known-bad placeholder feed id -- every date will 404.\n"
-                  "         Pass --feed-url <url> or --base64url <value> from the gtfsrt.io "
-                  "inventory.\n")
+                  "         Either download the feed once and use --local <path>, or pass\n"
+                  "         --feed-url <url> / --base64url <value> from the gtfsrt.io inventory.\n")
         run(collect_real(args.days), "LIVE")
